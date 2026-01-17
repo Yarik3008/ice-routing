@@ -39,6 +39,7 @@ def distance(p1, p2):
 @app.post("/build-route")
 def build_route(data: RouteRequest):
     MAX_TOTAL_KG = 270
+    RAW_ICE_TIME_LIMIT = 50  # минут
 
     warehouse = data.warehouse
     orders = data.orders
@@ -46,26 +47,24 @@ def build_route(data: RouteRequest):
     points = [warehouse] + orders
     size = len(points)
 
-    # --- разделение льда ---
-
-    # 1️ склад загружает весь raw лёд
-    warehouse.raw_ice_kg = sum(
-        o.ice_kg for o in orders if o.ice_kg >= 100
-    )
-
-    warehouse.container_ice_kg = sum(
-        o.ice_kg for o in orders if o.ice_kg < 100
-    )
-
-    # 2️ заказы ВЫГРУЖАЮТ лёд
+    # --- разделение льда (Логика из ШАГА 3.3 и 3.4) ---
     for o in orders:
         if o.ice_kg >= 100:
-            o.raw_ice_kg = -o.ice_kg
+            o.raw_ice_kg = o.ice_kg
             o.container_ice_kg = 0
         else:
             o.raw_ice_kg = 0
-            o.container_ice_kg = -o.ice_kg
+            o.container_ice_kg = o.ice_kg
 
+    # Веса для Capacity Dimension (ШАГ 3.1)
+    # Склад загружает всё, заказы выгружают
+    warehouse.raw_ice_kg = sum(o.raw_ice_kg for o in orders)
+    warehouse.container_ice_kg = sum(o.container_ice_kg for o in orders)
+    
+    # Для OR-Tools используем отрицательные значения для выгрузки (demand)
+    # Но в этой реализации мы используем UnaryTransitCallback, который обычно работает с положительным спросом
+    # Пересчитаем для классической модели: склад 0, заказы +вес
+    
     dist_matrix = [
         [distance(points[i], points[j]) for j in range(size)]
         for i in range(size)
@@ -74,84 +73,42 @@ def build_route(data: RouteRequest):
     manager = pywrapcp.RoutingIndexManager(size, 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    # ---------- TIME ----------
+    # ---------- TIME (ШАГ 2) ----------
     def time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
         return travel_time(points[from_node], points[to_node])
 
     time_cb = routing.RegisterTransitCallback(time_callback)
-
-    routing.AddDimension(
-        time_cb,
-        0,
-        1440,
-        False,
-        "Time"
-    )
-
+    routing.AddDimension(time_cb, 1440, 1440, False, "Time")
     time_dimension = routing.GetDimensionOrDie("Time")
 
-    RAW_ICE_TIME_LIMIT = 50  # минут
-
-    def raw_ice_time_callback(from_index, to_index):
-        # сколько raw льда В МАШИНЕ до выезда
-        raw_load = solution.Value(
-            raw_load_dimension.CumulVar(from_index)
-        )
-
-        if raw_load > 0:
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            return travel_time(points[from_node], points[to_node])
-
-        return 0
-
-    raw_time_cb = routing.RegisterTransitCallback(raw_ice_time_callback)
-
-    routing.AddDimension(
-        raw_time_cb,
-        0,                    # без ожиданий
-        RAW_ICE_TIME_LIMIT,   # ⏱️ максимум 50 минут
-        True,                 # старт = 0
-        "RawIceTime"
-    )
-
-    # Стартуем строго в момент 0
-    start_index = manager.NodeToIndex(0)
-    time_dimension.CumulVar(start_index).SetValue(0)
-    RAW_ICE_TIME_LIMIT = 50  # минут
-
-    # ---------- CAPACITY ----------
-    def raw_load_callback(from_index):
+    # ---------- CAPACITY (ШАГ 3.1) ----------
+    def demand_callback(from_index):
         node = manager.IndexToNode(from_index)
-        return points[node].raw_ice_kg
+        if node == 0: return 0
+        return points[node].ice_kg
 
-    raw_load_cb = routing.RegisterUnaryTransitCallback(raw_load_callback)
+    demand_cb = routing.RegisterUnaryTransitCallback(demand_callback)
+    routing.AddDimension(demand_cb, 0, MAX_TOTAL_KG, True, "Capacity")
 
-    routing.AddDimension(
-        raw_load_cb,
-        0,
-        MAX_TOTAL_KG,
-        True,
-        "RawLoad"
-    )
-    raw_load_dimension = routing.GetDimensionOrDie("RawLoad")
-
-    # ---------- TIME WINDOWS (ТОЛЬКО ДЛЯ ЗАКАЗОВ) ----------
+    # ---------- TIME WINDOWS & RAW ICE LIMIT (ШАГ 3.4) ----------
     for i, point in enumerate(points):
+        index = manager.NodeToIndex(i)
+        
         if i == 0:
+            time_dimension.CumulVar(index).SetRange(0, 1440)
             continue
 
-        index = manager.NodeToIndex(i)
+        start = int(point.time_start)
+        end = int(point.time_end)
 
-        # обычные заказы
-        start = point.time_start
-        end = point.time_end
-
-        # ❄️ RAW ICE — жесткое ограничение
-        if point.ice_kg >= 100:
+        # Если есть сырой лед (>= 100кг), ограничиваем время доставки 50 минутами
+        if point.raw_ice_kg > 0:
             end = min(end, RAW_ICE_TIME_LIMIT)
+
+        if start > end:
+            return {"error": f"Заказ '{point.name}' невозможен (лед растает раньше начала окна или окно некорректно)"}
 
         time_dimension.CumulVar(index).SetRange(start, end)
 
@@ -179,24 +136,30 @@ def build_route(data: RouteRequest):
     if not solution:
         return {"error": "Route not found"}
 
-    # ---------- RESULT ----------
+    # ---------- RESULT (ШАГ 3.2) ----------
     index = routing.Start(0)
     route = []
+    total_weight = 0
 
     while not routing.IsEnd(index):
         node = manager.IndexToNode(index)
         arrival = solution.Value(time_dimension.CumulVar(index))
+        point_data = points[node]
         route.append({
-            "point": points[node].name,
-            "arrival_minute": arrival
+            "point": point_data.name,
+            "arrival_minute": arrival,
+            "ice_kg": point_data.ice_kg,
+            "type": "raw" if point_data.raw_ice_kg > 0 else "container"
         })
         index = solution.Value(routing.NextVar(index))
 
-    # 🔥 ЯВНО добавляем возврат на склад
+    # Финальное возвращение на склад
+    node = manager.IndexToNode(index)
     arrival = solution.Value(time_dimension.CumulVar(index))
     route.append({
-        "point": warehouse.name,
-        "arrival_minute": arrival
+        "point": points[node].name,
+        "arrival_minute": arrival,
+        "type": "finish"
     })
 
-    return {"route": route}
+    return {"route": route, "total_weight_kg": sum(o.ice_kg for o in orders)}
